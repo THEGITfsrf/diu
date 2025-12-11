@@ -15,7 +15,7 @@ app.all("/ping", (req, res) => {
 
 // Default catch-all
 app.all("*", (req, res) => {
-  res.status(404).json({ error: "Not found" });
+  res.json({message: "YAY"});
 });
 
 const port = process.env.PORT || 3000;
