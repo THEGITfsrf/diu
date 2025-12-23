@@ -16,7 +16,7 @@ app.all("/ping", (req, res) => {
 });
 
 // Default catch-all API route
-app.all("/api/*", (req, res) => {
+app.all("/apx/*", (req, res) => {
   console.log("API request:", req.method, req.url);
   res.json({ message: "YAY" });
 });
