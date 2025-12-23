@@ -8,7 +8,7 @@ const PORT = 3000;
 function decodeBase64(str) {
   try {
     return Buffer.from(str, "base64").toString("utf-8");
-  } catch {
+  } catch (err) {
     return null;
   }
 }
