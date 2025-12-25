@@ -50,6 +50,11 @@ app.get("/apx/stuff/:b64", async (req, res) => {
   try {
     const response = await fetch(target);
     const contentType = response.headers.get("content-type") || "";
+    response.headers.forEach((value, key) => {
+      if (!["x-frame-options", "content-security-policy"].includes(key.toLowerCase())) {
+        res.setHeader(key, value);
+      }
+    });
 
     if (contentType.includes("text/html")) {
       let html = await response.text();
