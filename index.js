@@ -48,8 +48,15 @@ app.get("/apx/stuff/:b64", async (req, res) => {
   }
 
   try {
-    const response = await fetch(target);
+     const response = await fetch(target, {
+      headers: {
+        "accept-encoding": "identity"
+      }
+    });
+
     const contentType = response.headers.get("content-type") || "";
+
+    // Strip iframe-blocking headers
     response.headers.forEach((value, key) => {
       if (!["x-frame-options", "content-security-policy"].includes(key.toLowerCase())) {
         res.setHeader(key, value);
