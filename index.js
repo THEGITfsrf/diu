@@ -20,7 +20,7 @@ function rewriteHTML(html, baseUrl) {
   html = html.replace(
     /(href|src)="(https?:\/\/[^"]+)"/g,
     (m, attr, url) => {
-      const proxied = `/api/apx/stuff/${Buffer.from(url).toString("base64")}`;
+      const proxied = `/apx/stuff/${Buffer.from(url).toString("base64")}`;
       return `${attr}="${proxied}"`;
     }
   );
@@ -30,7 +30,7 @@ function rewriteHTML(html, baseUrl) {
     /(href|src)="(\/[^"]*)"/g,
     (m, attr, url) => {
       const fullUrl = new URL(url, baseUrl).href;
-      const proxied = `/api/apx/stuff/${Buffer.from(fullUrl).toString("base64")}`;
+      const proxied = `/apx/stuff/${Buffer.from(fullUrl).toString("base64")}`;
       return `${attr}="${proxied}"`;
     }
   );
