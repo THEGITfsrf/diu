@@ -1,18 +1,23 @@
 import express from "express";
+import { parse } from "node-html-parser";
+import dns from "dns/promises";
+import net from "net";
 
 const app = express();
 
-/* ---------------- Helpers ---------------- */
+/* ---------------- Base62 ---------------- */
+
 const BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 function encodeBase62(str) {
-  const bytes = Buffer.from(str, "utf8");
-  let num = BigInt("0x" + bytes.toString("hex"));
+  const buf = Buffer.from(str, "utf8");
+  if (buf.length > 2048) throw new Error("URL too long");
 
+  let num = BigInt("0x" + buf.toString("hex"));
   if (num === 0n) return "0";
 
   let out = "";
-  while (num > 0) {
+  while (num > 0n) {
     out = BASE62[Number(num % 62n)] + out;
     num /= 62n;
   }
@@ -21,118 +26,135 @@ function encodeBase62(str) {
 
 function decodeBase62(b62) {
   let num = 0n;
-
   for (const ch of b62) {
-    const val = BASE62.indexOf(ch);
-    if (val === -1) return null;
-    num = num * 62n + BigInt(val);
+    const v = BASE62.indexOf(ch);
+    if (v === -1) return null;
+    num = num * 62n + BigInt(v);
   }
 
   let hex = num.toString(16);
   if (hex.length % 2) hex = "0" + hex;
-
   return Buffer.from(hex, "hex").toString("utf8");
 }
 
-function decodeBase64(str) {
+/* ---------------- Security ---------------- */
+
+async function isBlockedHost(hostname) {
+  if (
+    hostname === "localhost" ||
+    hostname.endsWith(".local")
+  ) return true;
+
+  const res = await dns.lookup(hostname, { all: true });
+  return res.some(r =>
+    net.isPrivate(r.address) ||
+    r.address.startsWith("169.254.")
+  );
+}
+
+function safeURL(url, base) {
   try {
-    return Buffer.from(str, "base64").toString("utf-8");
+    const u = new URL(url, base);
+    if (!["http:", "https:"].includes(u.protocol)) return null;
+    return u.href;
   } catch {
     return null;
   }
 }
 
+/* ---------------- HTML Rewrite ---------------- */
+
 function rewriteHTML(html, baseUrl) {
-  html = html.replace(
-    /(href|src)="(https?:\/\/[^"]+)"/g,
-    (m, attr, url) => {
-      const proxied = `/apx/stuff/${encodeBase62(url)}`;
-      return `${attr}="${proxied}"`;
-    }
-  );
+  const root = parse(html, {
+    lowerCaseTagName: false,
+    comment: false
+  });
 
-  html = html.replace(
-    /(href|src)="(\/[^"]*)"/g,
-    (m, attr, url) => {
-      const fullUrl = new URL(url, baseUrl).href;
-      const proxied = `/apx/stuff/${encodeBase62(fullUrl)}`;
-      return `${attr}="${proxied}"`;
-    }
-  );
+  // kill <base> tags (fix #4)
+  root.querySelectorAll("base").forEach(b => b.remove());
 
-  return html;
+  const attrs = ["href", "src", "action"];
+
+  root.querySelectorAll("*").forEach(el => {
+    for (const attr of attrs) {
+      const val = el.getAttribute(attr);
+      if (!val) continue;
+
+      // skip data/blob/mailto/etc (fix #6)
+      if (/^(data|blob|mailto|javascript):/i.test(val)) continue;
+
+      const full = safeURL(val, baseUrl);
+      if (!full) continue;
+
+      el.setAttribute(attr, `/apx/stuff/${encodeBase62(full)}`);
+    }
+  });
+
+  return root.toString();
 }
 
+/* ---------------- Route ---------------- */
 
-/* ---------------- Routes ---------------- */
-
-// Proxy & rewrite endpoint
 app.get("/apx/stuff/:b62", async (req, res) => {
   const target = decodeBase62(req.params.b62);
-  if (!target) {
-    return res.status(400).json({ error: "Invalid base62 URL" });
-  }
+  if (!target) return res.status(400).send("Bad URL");
 
+  let url;
   try {
-     const response = await fetch(target, {
-      headers: {
-        "accept-encoding": "identity"
-      }
-    });
-
-    const contentType = response.headers.get("content-type") || "";
-
-    // Strip iframe-blocking headers
-    response.headers.forEach((value, key) => {
-      if (!["x-frame-options", "content-security-policy"].includes(key.toLowerCase())) {
-        res.setHeader(key, value);
-      }
-    });
-
-    if (contentType.includes("text/html")) {
-      let html = await response.text();
-      html = rewriteHTML(html, target);
-      res.set("content-type", contentType);
-      res.send(html);
-    } else {
-      const buffer = Buffer.from(await response.arrayBuffer());
-      res.set("content-type", contentType);
-      res.send(buffer);
-    }
-  } catch (err) {
-    res.status(500).json({
-      error: "Failed to fetch URL",
-      details: err.message
-    });
+    url = new URL(target);
+  } catch {
+    return res.status(400).send("Invalid URL");
   }
-});
 
-// Test page
-app.get("/apx", (req, res) => {
-  res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>Mini Rewriter Proxy</title>
-</head>
-<body>
-  <h1>Mini Rewriter Proxy</h1>
-  <input id="url" placeholder="Enter URL" style="width:300px;">
-  <button onclick="go()">Fetch & Rewrite</button>
-  <iframe id="frame" style="width:100%; height:500px; margin-top:10px;"></iframe>
+  // SSRF block (fix #7)
+  if (await isBlockedHost(url.hostname)) {
+    return res.status(403).send("Blocked host");
+  }
 
-  <script>
-    function go() {
-      const url = document.getElementById('url').value;
-      const b64 = btoa(url);
-      document.getElementById('frame').src = '/api/apx/stuff/' + b64;
+  const response = await fetch(url, {
+    redirect: "manual",
+    headers: { "accept-encoding": "identity" }
+  });
+
+  // handle redirects (fix #9)
+  if (response.status >= 300 && response.status < 400) {
+    const loc = response.headers.get("location");
+    if (loc) {
+      const full = safeURL(loc, url.href);
+      if (full) {
+        return res.redirect(
+          response.status,
+          `/apx/stuff/${encodeBase62(full)}`
+        );
+      }
     }
-  </script>
-</body>
-</html>`);
+  }
+
+  const ct = response.headers.get("content-type") || "";
+
+  // safe headers only (fix #8)
+  for (const [k, v] of response.headers) {
+    if (
+      ![
+        "content-length",
+        "set-cookie",
+        "content-security-policy",
+        "x-frame-options"
+      ].includes(k.toLowerCase())
+    ) {
+      res.setHeader(k, v);
+    }
+  }
+
+  if (ct.includes("text/html")) {
+    const html = await response.text();
+    res.send(rewriteHTML(html, url.href));
+  } else {
+    const buf = Buffer.from(await response.arrayBuffer());
+    res.send(buf);
+  }
 });
 
 /* ---------------- Export ---------------- */
 
-// IMPORTANT: export the app — no app.listen()
 export default app;
