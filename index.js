@@ -1,12 +1,10 @@
 import express from "express";
 import { parse } from "node-html-parser";
 import dns from "dns/promises";
-import net from "net";
 
 const app = express();
 
 /* ---------------- Base62 ---------------- */
-
 const BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 function encodeBase62(str) {
@@ -38,18 +36,25 @@ function decodeBase62(b62) {
 }
 
 /* ---------------- Security ---------------- */
+function isPrivateIP(ip) {
+  return (
+    ip === "127.0.0.1" ||            // localhost
+    ip.startsWith("10.") ||          // 10.0.0.0/8
+    ip.startsWith("192.168.") ||     // 192.168.0.0/16
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip) || // 172.16.0.0/12
+    ip.startsWith("169.254.")        // link-local
+  );
+}
 
 async function isBlockedHost(hostname) {
-  if (
-    hostname === "localhost" ||
-    hostname.endsWith(".local")
-  ) return true;
+  if (hostname === "localhost" || hostname.endsWith(".local")) return true;
 
-  const res = await dns.lookup(hostname, { all: true });
-  return res.some(r =>
-    net.isPrivate(r.address) ||
-    r.address.startsWith("169.254.")
-  );
+  try {
+    const res = await dns.lookup(hostname, { all: true });
+    return res.some(r => isPrivateIP(r.address));
+  } catch {
+    return true; // fail-safe block
+  }
 }
 
 function safeURL(url, base) {
@@ -63,24 +68,19 @@ function safeURL(url, base) {
 }
 
 /* ---------------- HTML Rewrite ---------------- */
-
 function rewriteHTML(html, baseUrl) {
-  const root = parse(html, {
-    lowerCaseTagName: false,
-    comment: false
-  });
+  const root = parse(html, { lowerCaseTagName: false, comment: false });
 
-  // kill <base> tags (fix #4)
+  // remove <base> tags
   root.querySelectorAll("base").forEach(b => b.remove());
 
   const attrs = ["href", "src", "action"];
-
   root.querySelectorAll("*").forEach(el => {
     for (const attr of attrs) {
       const val = el.getAttribute(attr);
       if (!val) continue;
 
-      // skip data/blob/mailto/etc (fix #6)
+      // skip data/blob/mailto/javascript
       if (/^(data|blob|mailto|javascript):/i.test(val)) continue;
 
       const full = safeURL(val, baseUrl);
@@ -94,7 +94,6 @@ function rewriteHTML(html, baseUrl) {
 }
 
 /* ---------------- Route ---------------- */
-
 app.get("/apx/stuff/:b62", async (req, res) => {
   const target = decodeBase62(req.params.b62);
   if (!target) return res.status(400).send("Bad URL");
@@ -106,7 +105,6 @@ app.get("/apx/stuff/:b62", async (req, res) => {
     return res.status(400).send("Invalid URL");
   }
 
-  // SSRF block (fix #7)
   if (await isBlockedHost(url.hostname)) {
     return res.status(403).send("Blocked host");
   }
@@ -116,7 +114,7 @@ app.get("/apx/stuff/:b62", async (req, res) => {
     headers: { "accept-encoding": "identity" }
   });
 
-  // handle redirects (fix #9)
+  // handle redirects
   if (response.status >= 300 && response.status < 400) {
     const loc = response.headers.get("location");
     if (loc) {
@@ -132,15 +130,10 @@ app.get("/apx/stuff/:b62", async (req, res) => {
 
   const ct = response.headers.get("content-type") || "";
 
-  // safe headers only (fix #8)
+  // safe headers only
   for (const [k, v] of response.headers) {
     if (
-      ![
-        "content-length",
-        "set-cookie",
-        "content-security-policy",
-        "x-frame-options"
-      ].includes(k.toLowerCase())
+      !["content-length", "set-cookie", "content-security-policy", "x-frame-options"].includes(k.toLowerCase())
     ) {
       res.setHeader(k, v);
     }
@@ -156,5 +149,4 @@ app.get("/apx/stuff/:b62", async (req, res) => {
 });
 
 /* ---------------- Export ---------------- */
-
 export default app;
