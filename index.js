@@ -3,6 +3,36 @@ import express from "express";
 const app = express();
 
 /* ---------------- Helpers ---------------- */
+const BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+function encodeBase62(str) {
+  const bytes = Buffer.from(str, "utf8");
+  let num = BigInt("0x" + bytes.toString("hex"));
+
+  if (num === 0n) return "0";
+
+  let out = "";
+  while (num > 0) {
+    out = BASE62[Number(num % 62n)] + out;
+    num /= 62n;
+  }
+  return out;
+}
+
+function decodeBase62(b62) {
+  let num = 0n;
+
+  for (const ch of b62) {
+    const val = BASE62.indexOf(ch);
+    if (val === -1) return null;
+    num = num * 62n + BigInt(val);
+  }
+
+  let hex = num.toString(16);
+  if (hex.length % 2) hex = "0" + hex;
+
+  return Buffer.from(hex, "hex").toString("utf8");
+}
 
 function decodeBase64(str) {
   try {
@@ -13,24 +43,19 @@ function decodeBase64(str) {
 }
 
 function rewriteHTML(html, baseUrl) {
-  // Example text replacement
-  html = html.replace(/Example/g, "MiniProxy");
-
-  // Rewrite absolute links
   html = html.replace(
     /(href|src)="(https?:\/\/[^"]+)"/g,
     (m, attr, url) => {
-      const proxied = `/apx/stuff/${Buffer.from(url).toString("base64")}`;
+      const proxied = `/apx/stuff/${encodeBase62(url)}`;
       return `${attr}="${proxied}"`;
     }
   );
 
-  // Rewrite relative links
   html = html.replace(
     /(href|src)="(\/[^"]*)"/g,
     (m, attr, url) => {
       const fullUrl = new URL(url, baseUrl).href;
-      const proxied = `/apx/stuff/${Buffer.from(fullUrl).toString("base64")}`;
+      const proxied = `/apx/stuff/${encodeBase62(fullUrl)}`;
       return `${attr}="${proxied}"`;
     }
   );
@@ -38,13 +63,14 @@ function rewriteHTML(html, baseUrl) {
   return html;
 }
 
+
 /* ---------------- Routes ---------------- */
 
 // Proxy & rewrite endpoint
-app.get("/apx/stuff/:b64", async (req, res) => {
-  const target = decodeBase64(req.params.b64);
+app.get("/apx/stuff/:b62", async (req, res) => {
+  const target = decodeBase62(req.params.b62);
   if (!target) {
-    return res.status(400).json({ error: "Invalid base64 URL" });
+    return res.status(400).json({ error: "Invalid base62 URL" });
   }
 
   try {
