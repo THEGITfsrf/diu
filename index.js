@@ -1,152 +1,113 @@
-import express from "express";
-import { parse } from "node-html-parser";
-import dns from "dns/promises";
+const express = require("express");
+const serverless = require("serverless-http");
+const fetch = require("node-fetch");
+const parse5 = require("parse5");
+const acorn = require("acorn");
+const escodegen = require("escodegen");
 
 const app = express();
+app.use(express.json());
 
-/* ---------------- Base62 ---------------- */
 const BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-function encodeBase62(str) {
-  const buf = Buffer.from(str, "utf8");
-  if (buf.length > 2048) throw new Error("URL too long");
-
-  let num = BigInt("0x" + buf.toString("hex"));
-  if (num === 0n) return "0";
-
-  let out = "";
-  while (num > 0n) {
-    out = BASE62[Number(num % 62n)] + out;
-    num /= 62n;
+// Simple Base62 decode
+function decodeBase62(str) {
+  let num = 0;
+  for (let i = 0; i < str.length; i++) {
+    const index = BASE62.indexOf(str[i]);
+    if (index === -1) return null;
+    num = num * 62 + index;
   }
-  return out;
+  return num;
 }
 
-function decodeBase62(b62) {
-  let num = 0n;
-  for (const ch of b62) {
-    const v = BASE62.indexOf(ch);
-    if (v === -1) return null;
-    num = num * 62n + BigInt(v);
-  }
+// Simulated DB: map IDs to URLs
+const URL_MAP = {
+  1: "https://example.com",
+  2: "https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"
+  // add more mappings here
+};
 
-  let hex = num.toString(16);
-  if (hex.length % 2) hex = "0" + hex;
-  return Buffer.from(hex, "hex").toString("utf8");
-}
-
-/* ---------------- Security ---------------- */
-function isPrivateIP(ip) {
-  return (
-    ip === "127.0.0.1" ||            // localhost
-    ip.startsWith("10.") ||          // 10.0.0.0/8
-    ip.startsWith("192.168.") ||     // 192.168.0.0/16
-    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip) || // 172.16.0.0/12
-    ip.startsWith("169.254.")        // link-local
-  );
-}
-
-async function isBlockedHost(hostname) {
-  if (hostname === "localhost" || hostname.endsWith(".local")) return true;
-
-  try {
-    const res = await dns.lookup(hostname, { all: true });
-    return res.some(r => isPrivateIP(r.address));
-  } catch {
-    return true; // fail-safe block
-  }
-}
-
-function safeURL(url, base) {
-  try {
-    const u = new URL(url, base);
-    if (!["http:", "https:"].includes(u.protocol)) return null;
-    return u.href;
-  } catch {
-    return null;
-  }
-}
-
-/* ---------------- HTML Rewrite ---------------- */
-function rewriteHTML(html, baseUrl) {
-  const root = parse(html, { lowerCaseTagName: false, comment: false });
-
-  // remove <base> tags
-  root.querySelectorAll("base").forEach(b => b.remove());
-
-  const attrs = ["href", "src", "action"];
-  root.querySelectorAll("*").forEach(el => {
-    for (const attr of attrs) {
-      const val = el.getAttribute(attr);
-      if (!val) continue;
-
-      // skip data/blob/mailto/javascript
-      if (/^(data|blob|mailto|javascript):/i.test(val)) continue;
-
-      const full = safeURL(val, baseUrl);
-      if (!full) continue;
-
-      el.setAttribute(attr, `/apx/stuff/${encodeBase62(full)}`);
-    }
-  });
-
-  return root.toString();
-}
-
-/* ---------------- Route ---------------- */
+// /apx/stuff/:b62 route
 app.get("/apx/stuff/:b62", async (req, res) => {
-  const target = decodeBase62(req.params.b62);
-  if (!target) return res.status(400).send("Bad URL");
+  const targetId = decodeBase62(req.params.b62);
+  if (!targetId) return res.status(400).send("Bad URL");
 
-  let url;
+  const targetUrl = URL_MAP[targetId];
+  if (!targetUrl) return res.status(404).send("Not Found");
+
   try {
-    url = new URL(target);
-  } catch {
-    return res.status(400).send("Invalid URL");
-  }
+    const response = await fetch(targetUrl);
+    const contentType = response.headers.get("content-type") || "";
 
-  if (await isBlockedHost(url.hostname)) {
-    return res.status(403).send("Blocked host");
-  }
+    // HTML rewriting
+    if (contentType.includes("text/html")) {
+      const htmlText = await response.text();
+      const document = parse5.parse(htmlText);
 
-  const response = await fetch(url, {
-    redirect: "manual",
-    headers: { "accept-encoding": "identity" }
-  });
+      // Example: inject script at <head>
+      const scriptNode = {
+        nodeName: "script",
+        tagName: "script",
+        attrs: [],
+        namespaceURI: "http://www.w3.org/1999/xhtml",
+        childNodes: [
+          {
+            nodeName: "#text",
+            value: 'console.log("HTML Rewritten by Proxy!");'
+          }
+        ]
+      };
 
-  // handle redirects
-  if (response.status >= 300 && response.status < 400) {
-    const loc = response.headers.get("location");
-    if (loc) {
-      const full = safeURL(loc, url.href);
-      if (full) {
-        return res.redirect(
-          response.status,
-          `/apx/stuff/${encodeBase62(full)}`
-        );
+      const htmlNode = document.childNodes.find(n => n.nodeName === "html");
+      if (htmlNode) {
+        const head = htmlNode.childNodes.find(n => n.nodeName === "head");
+        if (head) head.childNodes.push(scriptNode);
       }
+
+      const rewrittenHtml = parse5.serialize(document);
+      res.set("content-type", "text/html");
+      return res.send(rewrittenHtml);
+
+    } else if (contentType.includes("javascript")) {
+      // JS rewriting
+      const jsText = await response.text();
+      const ast = acorn.parse(jsText, { ecmaVersion: "latest", sourceType: "module" });
+
+      // Inject console.log at start
+      ast.body.unshift({
+        type: "ExpressionStatement",
+        expression: {
+          type: "CallExpression",
+          callee: {
+            type: "MemberExpression",
+            object: { type: "Identifier", name: "console" },
+            property: { type: "Identifier", name: "log" },
+            computed: false
+          },
+          arguments: [{ type: "Literal", value: "JS Rewritten by Proxy!" }]
+        }
+      });
+
+      const rewrittenJs = escodegen.generate(ast);
+      res.set("content-type", "application/javascript");
+      return res.send(rewrittenJs);
+
+    } else {
+      // Other types: proxy as-is
+      const buffer = await response.arrayBuffer();
+      res.set("content-type", contentType);
+      return res.send(Buffer.from(buffer));
     }
-  }
-
-  const ct = response.headers.get("content-type") || "";
-
-  // safe headers only
-  for (const [k, v] of response.headers) {
-    if (
-      !["content-length", "set-cookie", "content-security-policy", "x-frame-options"].includes(k.toLowerCase())
-    ) {
-      res.setHeader(k, v);
-    }
-  }
-
-  if (ct.includes("text/html")) {
-    const html = await response.text();
-    res.send(rewriteHTML(html, url.href));
-  } else {
-    const buf = Buffer.from(await response.arrayBuffer());
-    res.send(buf);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Proxy error: " + err.message);
   }
 });
 
-/* ---------------- Export ---------------- */
-export default app;
+// Optional catch-all proxy for any other routes
+app.all("*", async (req, res) => {
+  res.status(404).send("Use /apx/stuff/:b62");
+});
+
+module.exports = serverless(app);
